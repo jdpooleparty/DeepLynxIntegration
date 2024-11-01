@@ -1,0 +1,10 @@
+fastapi>=0.100.0
+uvicorn==0.20.0
+deep-lynx>=0.1.7
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+python-jose==3.3.0
+python-multipart==0.0.5
+bcrypt==4.0.1
+passlib==1.7.4 
