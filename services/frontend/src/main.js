@@ -8,20 +8,35 @@ import store from './store';
 
 const app = createApp(App);
 
-axios.defaults.withCredentials = true;
-axios.defaults.baseURL = 'http://localhost:5000/';  // the FastAPI backend
+// Configure axios defaults with more detailed error logging
+axios.defaults.baseURL = 'http://localhost:5000';
+axios.defaults.headers.common['Accept'] = 'application/json';
+axios.defaults.headers.common['Content-Type'] = 'application/json';
 
-// Add interceptor for handling expired tokens
-axios.interceptors.response.use(undefined, function (error) {
-  if (error) {
-    const originalRequest = error.config;
-    if (error.response.status === 401 && !originalRequest._retry) {
-      originalRequest._retry = true;
-      store.dispatch('logOut');
-      return router.push('/login')
-    }
+// Add response interceptor for debugging
+axios.interceptors.response.use(
+  response => {
+    console.log('API Response:', response);
+    return response;
+  },
+  error => {
+    console.error('API Error:', error.response?.data || error.message);
+    console.error('Full error:', error);
+    return Promise.reject(error);
   }
-});
+);
+
+// Add request interceptor for debugging
+axios.interceptors.request.use(
+  config => {
+    console.log('API Request:', config.method.toUpperCase(), config.url);
+    return config;
+  },
+  error => {
+    console.error('Request Error:', error);
+    return Promise.reject(error);
+  }
+);
 
 app.use(router);
 app.use(store);

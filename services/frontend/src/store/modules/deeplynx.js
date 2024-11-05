@@ -1,5 +1,25 @@
 import axios from 'axios';
 
+// Create axios instance with custom config
+const api = axios.create({
+  baseURL: 'http://localhost:5000',
+  headers: {
+    'Content-Type': 'application/json'
+  }
+});
+
+// Add response interceptor for debugging
+api.interceptors.response.use(
+  response => {
+    console.log('API Response:', response);
+    return response;
+  },
+  error => {
+    console.error('API Error:', error.response?.data || error.message);
+    return Promise.reject(error);
+  }
+);
+
 const state = {
   ontologyData: null,
   dataSources: null,
@@ -15,33 +35,53 @@ const getters = {
 };
 
 const actions = {
-  // Ontology actions
   async fetchOntology({ commit }) {
     try {
-      const { data } = await axios.get('ontology');
-      commit('setOntologyData', data);
+      console.log('Fetching ontology data...');
+      const response = await api.get('/ontology');
+      console.log('Raw ontology response:', response);
+      
+      if (!response.data) {
+        throw new Error('No data received from API');
+      }
+
+      const formattedData = {
+        nodes: Array.isArray(response.data.nodes) ? response.data.nodes : [],
+        relationships: Array.isArray(response.data.relationships) ? response.data.relationships : []
+      };
+      
+      console.log('Formatted ontology data:', formattedData);
+      commit('setOntologyData', formattedData);
     } catch (error) {
-      commit('setError', error.message);
+      console.error('Error fetching ontology:', error);
+      commit('setError', error.response?.data?.detail || error.message || 'Failed to fetch ontology data');
+      throw error;  // Re-throw to handle in component
     }
   },
 
-  // Data source actions
   async fetchDataSources({ commit }) {
     try {
-      const { data } = await axios.get('datasources');
-      commit('setDataSources', data);
+      console.log('Fetching data sources...');
+      const response = await api.get('/datasources');
+      console.log('Data sources response:', response);
+      commit('setDataSources', response.data);
     } catch (error) {
-      commit('setError', error.message);
+      console.error('Error fetching data sources:', error);
+      commit('setError', error.response?.data?.detail || error.message);
+      throw error;
     }
   },
 
-  // Type mapping actions
   async fetchTypeMappings({ commit }) {
     try {
-      const { data } = await axios.get('typemappings');
-      commit('setTypeMappings', data);
+      console.log('Fetching type mappings...');
+      const response = await api.get('/typemappings');
+      console.log('Type mappings response:', response);
+      commit('setTypeMappings', response.data);
     } catch (error) {
-      commit('setError', error.message);
+      console.error('Error fetching type mappings:', error);
+      commit('setError', error.response?.data?.detail || error.message);
+      throw error;
     }
   }
 };
@@ -49,12 +89,15 @@ const actions = {
 const mutations = {
   setOntologyData(state, data) {
     state.ontologyData = data;
+    state.error = null;
   },
-  setDataSources(state, sources) {
-    state.dataSources = sources;
+  setDataSources(state, data) {
+    state.dataSources = data;
+    state.error = null;
   },
-  setTypeMappings(state, mappings) {
-    state.typeMappings = mappings;
+  setTypeMappings(state, data) {
+    state.typeMappings = data;
+    state.error = null;
   },
   setError(state, error) {
     state.error = error;

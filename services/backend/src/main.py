@@ -1,49 +1,43 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any
-from pydantic import BaseModel
+from fastapi.responses import RedirectResponse
 
-app = FastAPI()
+app = FastAPI(
+    title="Deep-Lynx Integration",
+    description="API for integrating with Deep-Lynx",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mock data for initial testing
-@app.get("/ontology")
-async def get_ontology() -> Dict[str, Any]:
-    return {
-        "nodes": [
-            {"id": 1, "name": "Person", "type": "container"},
-            {"id": 2, "name": "Address", "type": "container"}
-        ],
-        "relationships": [
-            {"source": 1, "target": 2, "type": "has"}
-        ]
-    }
+# Basic test endpoints
+@app.get("/", tags=["Root"])
+async def root():
+    """Root endpoint that returns a welcome message"""
+    return {"message": "Welcome to Deep-Lynx Integration API"}
 
-@app.get("/datasources")
-async def get_datasources() -> List[Dict[str, Any]]:
-    return [
-        {"id": 1, "name": "CSV Import", "type": "file", "status": "active"},
-        {"id": 2, "name": "API Feed", "type": "api", "status": "inactive"}
-    ]
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+# Data Source endpoints
+@app.get("/datasources", tags=["Data Sources"])
+async def get_datasources():
+    """Get all data sources"""
+    return {"message": "List of data sources"}
 
-@app.get("/typemappings")
-async def get_typemappings() -> List[Dict[str, Any]]:
-    return [
-        {
-            "id": 1,
-            "sourceType": "PersonRecord",
-            "targetType": "Person",
-            "rules": {"name": "$.fullName", "age": "$.age"}
-        }
-    ]
+@app.post("/datasources", tags=["Data Sources"])
+async def create_datasource():
+    """Create a new data source"""
+    return {"message": "Create data source"}
 
-@app.get("/")
-def home():
-    return "Hello, World!" 
+@app.get("/datasources/{datasource_id}", tags=["Data Sources"])
+async def get_datasource(datasource_id: str):
+    """Get a specific data source by ID"""
+    return {"message": f"Get data source {datasource_id}"}

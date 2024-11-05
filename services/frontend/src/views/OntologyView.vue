@@ -7,7 +7,7 @@
     </div>
     <div v-else class="row">
       <div class="col-md-8">
-        <div ref="graphContainer" id="ontology-graph" style="height: 600px; border: 1px solid #ccc;"></div>
+        <div ref="graphContainer" id="ontology-graph"></div>
       </div>
       <div class="col-md-4">
         <div class="card">
@@ -24,6 +24,13 @@
             </div>
           </div>
         </div>
+        <!-- Debug info -->
+        <div class="card mt-3">
+          <div class="card-body">
+            <h5 class="card-title">Debug Info</h5>
+            <pre>{{ JSON.stringify(ontologyData, null, 2) }}</pre>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -37,10 +44,12 @@ export default {
   name: 'OntologyView',
   data() {
     return {
-      loading: false,
+      loading: true,
       selectedNode: null,
       simulation: null,
-      svg: null
+      svg: null,
+      width: 800,
+      height: 600
     }
   },
   computed: {
@@ -50,115 +59,156 @@ export default {
     })
   },
   async created() {
-    this.loading = true
-    await this.$store.dispatch('fetchOntology')
-    this.loading = false
+    try {
+      await this.$store.dispatch('fetchOntology');
+    } catch (error) {
+      console.error('Error in created:', error);
+    } finally {
+      this.loading = false;
+    }
   },
   mounted() {
-    this.initializeGraph()
+    window.addEventListener('resize', this.handleResize);
+    this.handleResize();
+  },
+  beforeUnmount() {
+    window.removeEventListener('resize', this.handleResize);
   },
   methods: {
+    handleResize() {
+      const container = this.$refs.graphContainer;
+      if (container) {
+        this.width = container.clientWidth;
+        this.height = container.clientHeight || 600;
+        if (this.svg) {
+          this.svg
+            .attr('width', this.width)
+            .attr('height', this.height);
+          
+          if (this.simulation) {
+            this.simulation.force('center', d3.forceCenter(this.width / 2, this.height / 2));
+            this.simulation.alpha(1).restart();
+          }
+        }
+      }
+    },
     initializeGraph() {
-      if (!this.ontologyData) return
+      if (!this.ontologyData?.nodes?.length) return;
+      
+      const container = this.$refs.graphContainer;
+      if (!container) return;
 
-      const container = this.$refs.graphContainer
-      const width = container.clientWidth
-      const height = container.clientHeight
-
-      // Clear any existing SVG
-      d3.select("#ontology-graph svg").remove()
+      // Clear existing SVG
+      d3.select("#ontology-graph svg").remove();
 
       // Create SVG
       this.svg = d3.select("#ontology-graph")
         .append("svg")
-        .attr("width", width)
-        .attr("height", height)
+        .attr("width", this.width)
+        .attr("height", this.height);
 
       // Create force simulation
       this.simulation = d3.forceSimulation(this.ontologyData.nodes)
-        .force("link", d3.forceLink(this.ontologyData.relationships)
+        .force("link", d3.forceLink()
           .id(d => d.id)
-          .distance(100))
-        .force("charge", d3.forceManyBody().strength(-300))
-        .force("center", d3.forceCenter(width / 2, height / 2))
+          .links(this.ontologyData.relationships))
+        .force("charge", d3.forceManyBody().strength(-1000))
+        .force("center", d3.forceCenter(this.width / 2, this.height / 2))
+        .force("collision", d3.forceCollide().radius(50));
+
+      // Create arrow marker
+      this.svg.append("defs").append("marker")
+        .attr("id", "arrowhead")
+        .attr("viewBox", "-0 -5 10 10")
+        .attr("refX", 30)
+        .attr("refY", 0)
+        .attr("orient", "auto")
+        .attr("markerWidth", 6)
+        .attr("markerHeight", 6)
+        .append("path")
+        .attr("d", "M 0,-5 L 10,0 L 0,5")
+        .attr("fill", "#999");
 
       // Draw links
-      const links = this.svg.append("g")
+      const link = this.svg.append("g")
         .selectAll("line")
         .data(this.ontologyData.relationships)
-        .enter()
-        .append("line")
+        .join("line")
         .attr("stroke", "#999")
         .attr("stroke-width", 2)
+        .attr("marker-end", "url(#arrowhead)");
 
-      // Draw nodes
-      const nodes = this.svg.append("g")
-        .selectAll("circle")
+      // Create node groups
+      const node = this.svg.append("g")
+        .selectAll("g")
         .data(this.ontologyData.nodes)
-        .enter()
-        .append("circle")
-        .attr("r", 10)
-        .attr("fill", "#69b3a2")
+        .join("g")
         .call(d3.drag()
           .on("start", this.dragstarted)
           .on("drag", this.dragged)
-          .on("end", this.dragended))
-        .on("click", (event, d) => {
-          this.selectedNode = d
-        })
+          .on("end", this.dragended));
 
-      // Add node labels
-      const labels = this.svg.append("g")
-        .selectAll("text")
-        .data(this.ontologyData.nodes)
-        .enter()
-        .append("text")
+      // Add circles to nodes
+      node.append("circle")
+        .attr("r", 25)
+        .attr("fill", "#69b3a2")
+        .attr("stroke", "#fff")
+        .attr("stroke-width", 2);
+
+      // Add labels to nodes
+      node.append("text")
         .text(d => d.name)
-        .attr("font-size", "12px")
-        .attr("dx", 15)
-        .attr("dy", 4)
+        .attr("text-anchor", "middle")
+        .attr("dy", ".35em")
+        .attr("fill", "#fff");
 
-      // Update positions on each tick
+      // Update positions on simulation tick
       this.simulation.on("tick", () => {
-        links
+        link
           .attr("x1", d => d.source.x)
           .attr("y1", d => d.source.y)
           .attr("x2", d => d.target.x)
-          .attr("y2", d => d.target.y)
+          .attr("y2", d => d.target.y);
 
-        nodes
-          .attr("cx", d => d.x)
-          .attr("cy", d => d.y)
+        node
+          .attr("transform", d => `translate(${d.x},${d.y})`);
+      });
 
-        labels
-          .attr("x", d => d.x)
-          .attr("y", d => d.y)
-      })
+      // Add click handlers
+      node.on("click", (event, d) => {
+        event.stopPropagation();
+        this.selectedNode = d;
+      });
+
+      this.svg.on("click", () => {
+        this.selectedNode = null;
+      });
     },
     dragstarted(event) {
-      if (!event.active) this.simulation.alphaTarget(0.3).restart()
-      event.subject.fx = event.subject.x
-      event.subject.fy = event.subject.y
+      if (!event.active) this.simulation.alphaTarget(0.3).restart();
+      event.subject.fx = event.subject.x;
+      event.subject.fy = event.subject.y;
     },
     dragged(event) {
-      event.subject.fx = event.x
-      event.subject.fy = event.y
+      event.subject.fx = event.x;
+      event.subject.fy = event.y;
     },
     dragended(event) {
-      if (!event.active) this.simulation.alphaTarget(0)
-      event.subject.fx = null
-      event.subject.fy = null
+      if (!event.active) this.simulation.alphaTarget(0);
+      event.subject.fx = null;
+      event.subject.fy = null;
     }
   },
   watch: {
     ontologyData: {
       handler(newVal) {
-        if (newVal) {
+        if (newVal?.nodes?.length && !this.loading) {
           this.$nextTick(() => {
-            this.initializeGraph()
-          })
+            this.initializeGraph();
+          });
         }
       },
+      immediate: true,
       deep: true
     }
   }
@@ -167,6 +217,23 @@ export default {
 
 <style scoped>
 #ontology-graph {
-  background-color: #fff;
+  width: 100%;
+  height: 600px;
+  border: 1px solid #ccc;
+  background-color: #f8f9fa;
+  overflow: hidden;
+}
+
+.node circle {
+  cursor: pointer;
+}
+
+.node text {
+  pointer-events: none;
+  font-size: 12px;
+}
+
+line {
+  stroke-opacity: 0.6;
 }
 </style> 
