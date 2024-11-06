@@ -1,13 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from .middleware.auth import verify_auth
+from .routers import files, data_sources
+import logging
 
-app = FastAPI(
-    title="Deep-Lynx Integration",
-    description="API for integrating with Deep-Lynx",
-    version="1.0.0"
-)
+logger = logging.getLogger(__name__)
 
+app = FastAPI()
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,28 +17,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Basic test endpoints
-@app.get("/", tags=["Root"])
-async def root():
-    """Root endpoint that returns a welcome message"""
-    return {"message": "Welcome to Deep-Lynx Integration API"}
+# Register routers
+app.include_router(files.router)
+app.include_router(data_sources.router)
 
-@app.get("/health", tags=["Health"])
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Middleware to handle authentication"""
+    # Skip auth for health check and documentation
+    if request.url.path in ["/health", "/docs", "/openapi.json", "/redoc", "/redoc.standalone.html"]:
+        logger.debug(f"Skipping auth for {request.url.path}")
+        return await call_next(request)
+        
+    logger.debug(f"Processing request to: {request.url.path}")
+    return await verify_auth(request, call_next)
+
+@app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
-# Data Source endpoints
-@app.get("/datasources", tags=["Data Sources"])
-async def get_datasources():
-    """Get all data sources"""
-    return {"message": "List of data sources"}
 
-@app.post("/datasources", tags=["Data Sources"])
-async def create_datasource():
-    """Create a new data source"""
-    return {"message": "Create data source"}
-
-@app.get("/datasources/{datasource_id}", tags=["Data Sources"])
-async def get_datasource(datasource_id: str):
-    """Get a specific data source by ID"""
-    return {"message": f"Get data source {datasource_id}"}
+@app.on_event("startup")
+async def startup():
+    """Log all registered routes on startup"""
+    logger.debug("Registered routes:")
+    for route in app.routes:
+        logger.debug(f"  {route}")

@@ -11,7 +11,8 @@ from deep_lynx import (
 from ..models.auth import DeepLynxAuth, DeepLynxResponse
 from .config import get_settings
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ class DeepLynxClient:
             
             # Try direct token retrieval
             try:
+                logger.debug("Requesting OAuth token...")
                 token_response = self.auth_api.retrieve_o_auth_token(
                     x_api_key=self.settings.deep_lynx_api_key,
                     x_api_secret=self.settings.deep_lynx_api_secret,
@@ -95,39 +97,36 @@ class DeepLynxClient:
                 
                 # The token response IS the token for this version of Deep Lynx
                 token = str(token_response)
-                logger.debug(f"Token length: {len(token)}")
+                logger.debug(f"Token received (length: {len(token)})")
 
-                # Store auth info
+                # Update headers with token
+                self.api_client.default_headers['Authorization'] = f'Bearer {token}'
+                logger.debug("Updated headers with token")
+
+                # Store auth info - only pass required fields
                 self.auth = DeepLynxAuth(
-                    api_key=self.settings.deep_lynx_api_key,
-                    api_secret=self.settings.deep_lynx_api_secret,
                     token=token,
-                    container_id=self.container_id
+                    expiry='1h'  # TODO: Get actual expiry from response
                 )
-
-                # Update configuration and headers with token
-                self.config.access_token = token
-                self.api_client.default_headers.update({
-                    'Authorization': f'Bearer {token}'
-                })
-
-                logger.debug("Successfully authenticated with Deep Lynx")
-                logger.debug("Final headers: %s", 
-                    {k: '***' if k in ['x-api-key', 'x-api-secret', 'Authorization'] else v 
-                     for k, v in self.api_client.default_headers.items()})
                 
+                logger.info("Authentication successful")
                 return DeepLynxResponse(
                     status="success",
-                    message="Successfully authenticated",
-                    data={"container_id": self.container_id}
+                    message="Authenticated successfully",
+                    data={"token_length": len(token)}
                 )
 
-            except Exception as token_error:
-                logger.error(f"Token retrieval failed: {str(token_error)}")
-                raise Exception(f"Token retrieval failed: {str(token_error)}")
+            except Exception as auth_error:
+                logger.error(f"Token retrieval failed: {str(auth_error)}")
+                if hasattr(auth_error, 'body'):
+                    logger.error(f"Error response body: {auth_error.body}")
+                if hasattr(auth_error, 'headers'):
+                    logger.error("Error response headers: %s", 
+                        {k: v for k, v in auth_error.headers.items()})
+                raise
 
         except Exception as e:
-            logger.error(f"Authentication error: {str(e)}")
+            logger.error(f"Authentication failed: {str(e)}")
             return DeepLynxResponse(
                 status="error",
                 message=f"Authentication failed: {str(e)}"
@@ -171,6 +170,227 @@ class DeepLynxClient:
             auth_response = self.authenticate()
             return auth_response.status == "success"
         return True
+
+    async def upload_file(
+        self, 
+        file_path: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Upload a file to Deep Lynx"""
+        try:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+            # Ensure we're authenticated
+            if not self.auth:
+                await self._authenticate()
+
+            # Prepare file upload
+            with open(file_path, 'rb') as file:
+                file_name = os.path.basename(file_path)
+                
+                # Create file upload request
+                response = self.datasources_api.upload_file(
+                    container_id=self.settings.DEEP_LYNX_CONTAINER_ID,
+                    data_source_id="standard",  # Using standard data source
+                    file=file,
+                    metadata=metadata or {"filename": file_name}
+                )
+                
+                logger.info(f"Successfully uploaded file: {file_name}")
+                return response
+
+        except Exception as e:
+            logger.error(f"Failed to upload file: {str(e)}")
+            raise
+
+    async def associate_file_with_node(self, file_id: str, node_id: str) -> Dict[str, Any]:
+        """
+        Associate an uploaded file with a node in the ontology
+        """
+        try:
+            # Ensure we're authenticated
+            if not self.auth:
+                await self._authenticate()
+
+            # Create relationship between file and node
+            response = self.containers_api.create_edge(
+                container_id=self.settings.DEEP_LYNX_CONTAINER_ID,
+                body={
+                    "from_node": file_id,
+                    "to_node": node_id,
+                    "relationship_type": "ATTACHED_TO"  # You can customize this
+                }
+            )
+            
+            logger.info(f"Associated file {file_id} with node {node_id}")
+            return response
+
+        except Exception as e:
+            logger.error(f"Failed to associate file with node: {str(e)}")
+            raise
+
+    async def get_node_files(self, node_id: str) -> Dict[str, Any]:
+        """
+        Get all files associated with a specific node
+        """
+        try:
+            # Ensure we're authenticated
+            if not self.auth:
+                await self._authenticate()
+
+            logger.debug(f"Querying files for node {node_id}")
+            # Query for files attached to this node
+            response = self.containers_api.list_node_edges(
+                container_id=self.settings.DEEP_LYNX_CONTAINER_ID,
+                node_id=node_id,
+                relationship_type="ATTACHED_TO"
+            )
+            
+            logger.info(f"Retrieved files for node {node_id}")
+            return response
+
+        except Exception as e:
+            logger.error(f"Failed to get node files: {str(e)}")
+            raise
+        finally:
+            logger.debug(f"Completed get_node_files request for node {node_id}")
+
+    async def verify_container(self) -> bool:
+        """Verify container exists and is accessible"""
+        try:
+            if not self.auth:
+                await self._authenticate()
+                
+            container = self.containers_api.retrieve_container(
+                self.settings.deep_lynx_container_id
+            )
+            
+            # Use proper attribute access
+            if not container or not container.value:
+                logger.error("Container not found or invalid response")
+                return False
+                
+            if not hasattr(container.value, 'active') or not container.value.active:
+                logger.error("Container is not active")
+                return False
+                
+            if not hasattr(container.value, 'permissions'):
+                logger.error("No permissions attribute for container")
+                return False
+                
+            logger.info(f"Successfully verified container {self.settings.deep_lynx_container_id}")
+            return True
+        except ApiException as e:
+            if e.status == 401:
+                logger.error("Authentication required - attempting to re-authenticate")
+                try:
+                    await self._authenticate()
+                    return await self.verify_container()
+                except Exception as auth_e:
+                    logger.error(f"Re-authentication failed: {auth_e}")
+                    return False
+            else:
+                logger.error(f"Container verification failed: {e.body}")
+                return False
+
+    async def _authenticate(self):
+        """Internal authentication method"""
+        auth_response = self.authenticate()
+        if auth_response.status != "success":
+            raise Exception("Authentication failed")
+            
+        # Verify container access after authentication
+        if not await self.verify_container():
+            raise Exception(f"Could not access container {self.container_id}")
+
+    async def list_data_sources(self) -> Dict[str, Any]:
+        """List all data sources"""
+        try:
+            if not self.auth:
+                await self._authenticate()
+            
+            # Add container validation
+            await self.validate_container_access()
+            
+            response = self.datasources_api.list_data_sources(
+                container_id=self.settings.deep_lynx_container_id
+            )
+            return response
+        except Exception as e:
+            logger.error(f"Failed to list data sources: {str(e)}")
+            raise
+
+    async def create_data_source(self, data_source: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new data source with validation"""
+        try:
+            if not self.auth:
+                await self._authenticate()
+            
+            # Validate and sanitize input
+            sanitized_config = {
+                "name": str(data_source.get("name", "")),
+                "adapter_type": str(data_source.get("adapter_type", "standard")),
+                "active": bool(data_source.get("active", True)),
+                "data_format": str(data_source.get("data_format", "json")),
+                "config": data_source.get("config", {})
+            }
+            
+            # Ensure config is valid JSON
+            if not isinstance(sanitized_config["config"], dict):
+                sanitized_config["config"] = {}
+            
+            response = self.datasources_api.create_data_source(
+                container_id=self.settings.deep_lynx_container_id,
+                body=deep_lynx.CreateDataSourceRequest(**sanitized_config)
+            )
+            
+            logger.debug(f"Create data source response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to create data source: {str(e)}")
+            raise
+
+    async def get_data_source(self, datasource_id: str) -> Dict[str, Any]:
+        """Get a specific data source"""
+        try:
+            if not self.auth:
+                await self._authenticate()
+            
+            response = self.datasources_api.retrieve_data_source(
+                container_id=self.settings.deep_lynx_container_id,
+                data_source_id=datasource_id
+            )
+            return response
+        except Exception as e:
+            logger.error(f"Failed to get data source: {str(e)}")
+            raise
+
+    async def update_data_source(self, datasource_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a data source configuration"""
+        try:
+            if not self.auth:
+                await self._authenticate()
+            
+            # Ensure proper configuration structure
+            config = {
+                "configuration": {
+                    **updates,
+                    "config": updates.get("config", {}),
+                    "data_format": updates.get("data_format", "json")
+                }
+            }
+            
+            response = self.datasources_api.set_data_source_configuration(
+                container_id=self.settings.deep_lynx_container_id,
+                data_source_id=datasource_id,
+                body=config
+            )
+            logger.debug(f"Data source update response: {response}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to update data source: {str(e)}")
+            raise
 
 # Singleton instance
 _client: Optional[DeepLynxClient] = None
