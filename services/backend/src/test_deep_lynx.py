@@ -14,6 +14,8 @@ from typing import List, Dict, Any, Optional
 from contextlib import contextmanager
 import json
 from prometheus_client import Counter, Histogram, start_http_server
+import pytest
+import sys
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -84,43 +86,50 @@ class DeepLynxTransaction:
             ERROR_COUNTER.labels(error_type='transaction_error').inc()
 
 class DeepLynxTester:
-    def __init__(self):
-        # Load environment variables
-        load_dotenv()
+    def __init__(self, host: str, container_id: str):
+        """Initialize the tester with Deep Lynx configuration"""
+        # Debug initialization state
+        logger.info("\n=== Initializing Deep Lynx Tester ===")
+        logger.info(f"Host: {host}")
+        logger.info(f"API Key: {os.getenv('DEEP_LYNX_API_KEY')}")
+        logger.info(f"API Secret: {os.getenv('DEEP_LYNX_API_SECRET')}")
         
-        # Initialize configuration
-        self.configuration = deep_lynx.Configuration()
-        self.configuration.host = os.getenv('DEEP_LYNX_URL')
-        self.api_client = deep_lynx.ApiClient(self.configuration)
-        
-        # Initialize API instances
-        self.auth_api = deep_lynx.AuthenticationApi(self.api_client)
-        self.containers_api = deep_lynx.ContainersApi(self.api_client)
-        self.datasources_api = deep_lynx.DataSourcesApi(self.api_client)
-        self.metatypes_api = deep_lynx.MetatypesApi(self.api_client)
-        
-        # Authentication credentials
+        # Store credentials
         self.api_key = os.getenv('DEEP_LYNX_API_KEY')
         self.api_secret = os.getenv('DEEP_LYNX_API_SECRET')
         
-        # Get container ID from env with proper error handling
-        container_id_str = os.getenv('DEEP_LYNX_CONTAINER_ID')
-        if not container_id_str:
-            raise ValueError("DEEP_LYNX_CONTAINER_ID not set in environment")
+        # Initialize configuration properly
+        self.configuration = deep_lynx.Configuration()
+        self.configuration.host = host
+        
+        # Set up authentication with both key and secret
+        auth_str = f"{self.api_key}:{self.api_secret}"
+        self.configuration.api_key['Authorization'] = auth_str
+        self.configuration.api_key_prefix['Authorization'] = 'Basic'
+        
+        # Initialize API client and APIs
+        self.api_client = deep_lynx.ApiClient(self.configuration)
+        self.container_id = container_id
+        self.datasources_api = deep_lynx.DataSourcesApi(self.api_client)
+        self.imports_api = deep_lynx.ImportsApi(self.api_client)
+        self.data_query_api = deep_lynx.DataQueryApi(self.api_client)
+        self.containers_api = deep_lynx.ContainersApi(self.api_client)
+        
+        # Debug API initialization
+        logger.debug("\n=== API Initialization ===")
+        logger.debug(f"APIs initialized: datasources, imports, data_query, containers")
+        logger.debug(f"Auth string: {auth_str}")
+        
+    def check_health(self) -> bool:
+        """Check system health before operations"""
         try:
-            self.container_id = int(container_id_str)
-        except ValueError:
-            raise ValueError(f"Invalid DEEP_LYNX_CONTAINER_ID: {container_id_str}")
-
-        # Debug info with environment variable value
-        logger.info(f"Initialized with host: {self.configuration.host}")
-        logger.info(f"Using container ID from env: {self.container_id}")
-
-        # Initialize metrics server if enabled
-        if os.getenv('DEEP_LYNX_METRICS_ENABLED', 'false').lower() == 'true':
-            metrics_port = int(os.getenv('DEEP_LYNX_METRICS_PORT', '8000'))
-            start_http_server(metrics_port)
-            logger.info(f"Metrics server started on port {metrics_port}")
+            # Verify container exists
+            container = self.containers_api.retrieve_container(self.container_id)
+            logger.info(f"Successfully validated container {self.container_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Health check failed: {str(e)}")
+            return False
 
     @contextmanager
     def transaction(self, description: str):
@@ -132,36 +141,6 @@ class DeepLynxTester:
         except Exception as e:
             logger.error(f"Transaction failed: {e}")
             raise
-
-    def check_health(self) -> bool:
-        """Check system health before operations"""
-        try:
-            # Check Deep Lynx API health
-            if not self._check_api_health():
-                return False
-                
-            # Check container accessibility
-            if not self.validate_container():
-                return False
-                
-            # Check authentication
-            if 'Authorization' not in self.api_client.default_headers:
-                self.authenticate()
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
-
-    def _check_api_health(self) -> bool:
-        """Check Deep Lynx API health"""
-        try:
-            response = requests.get(f"{self.configuration.host}/health")
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"API health check failed: {e}")
-            return False
 
     @OPERATION_DURATION.labels(operation_type='create_data_source').time()
     def create_data_source(self, name: str, transaction: Optional[DeepLynxTransaction] = None) -> Any:
@@ -190,50 +169,32 @@ class DeepLynxTester:
     def authenticate(self):
         """Authenticate with Deep Lynx"""
         try:
-            # Debug logging for authentication attempt
             logger.info("Attempting authentication with Deep Lynx...")
             logger.info(f"Host: {self.configuration.host}")
-            
-            # Debug the actual values
             logger.info(f"API Key: {self.api_key}")
             logger.info(f"API Secret: {self.api_secret}")
             
-            if not self.api_key or not self.api_secret:
-                raise ValueError("API key or secret is missing from environment variables")
-
-            # Make request using requests library directly
-            headers = {
-                'x-api-key': self.api_key,
-                'x-api-secret': self.api_secret
-            }
+            # Make authentication request
+            logger.info(f"Making request to: {self.configuration.host}/oauth/token")
+            logger.info(f"With headers: {self.api_client.default_headers}")
             
-            url = f"{self.configuration.host}/oauth/token"
-            logger.info(f"Making request to: {url}")
-            logger.info(f"With headers: {headers}")
+            token_response = self.auth_api.retrieve_o_auth_token(
+                x_api_key=self.api_key,
+                x_api_secret=self.api_secret
+            )
             
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=0.5)
-            session.mount('http://', HTTPAdapter(max_retries=retries))
+            # Update headers with token
+            self.api_client.default_headers['Authorization'] = f"Bearer {token_response}"
             
-            response = session.get(url, headers=headers)
+            logger.info("Successfully authenticated with Deep Lynx")
+            logger.info(f"Response status: 200")
+            logger.info(f"Response text: {token_response}")
             
-            if response.status_code == 200:
-                # Extract token and update API client headers
-                token = response.text.strip('"')  # Remove quotes from token
-                self.api_client.default_headers['Authorization'] = f'Bearer {token}'
-                
-                logger.info("Successfully authenticated with Deep Lynx")
-                logger.info(f"Response status: {response.status_code}")
-                logger.info(f"Response text: {response.text[:100]}...")
-                return response.text
-            else:
-                logger.error(f"Authentication failed with status {response.status_code}")
-                logger.error(f"Response text: {response.text}")
-                raise ApiException(http_resp=response)
+            return True
             
         except Exception as e:
             logger.error(f"Unexpected error during authentication: {str(e)}")
-            raise
+            return False
 
     def list_data_sources(self):
         """List all data sources in container"""
@@ -271,146 +232,45 @@ class DeepLynxTester:
             raise
 
     def create_data_source(self, name="test_source", transaction=None):
-        """Create a data source in container with verification and rollback"""
-        retry_count = int(os.getenv('DEEP_LYNX_RETRY_COUNT', '3'))
-        created_id = None
-        
+        """Create a data source with complete configuration"""
         try:
-            logger.debug(f"Creating data source '{name}' in container {self.container_id}")
-            
-            # Pre-creation verification
-            existing_sources = self.list_data_sources()
-            initial_count = len(existing_sources)
-            logger.debug(f"Initial data source count: {initial_count}")
-            
             request = deep_lynx.CreateDataSourceRequest(
                 name=name,
                 adapter_type="standard",
                 active=True,
-                config={
-                    "data_format": "json",
-                    "type": "manual",
-                    "options": {},
-                    "unique_identifier_key": "id",
-                    "chunk_size": 1000,
-                    "polling_interval": 60000
-                }
+                config=deep_lynx.DataSourceConfig(  # Using correct parameters from API model
+                    kind="manual",
+                    data_type="json",
+                    data_format="json"
+                )
             )
             
-            # Retry loop for transient failures
-            for attempt in range(retry_count):
-                try:
-                    logger.debug(f"Create attempt {attempt + 1}/{retry_count}")
-                    datasource = self.datasources_api.create_data_source(
-                        container_id=self.container_id,
-                        body=request
-                    )
-                    
-                    if datasource and hasattr(datasource, 'value'):
-                        created_id = datasource.value.id
-                        logger.info(f"Created data source: {datasource.value.name} (ID: {created_id})")
-                        
-                        # Verify creation with multiple checks
-                        verification_success = self._verify_data_source_creation(
-                            created_id, name, initial_count
-                        )
-                        
-                        if verification_success:
-                            # Add to transaction if provided
-                            if transaction:
-                                transaction.operations.append({
-                                    'type': 'create_data_source',
-                                    'result': datasource.value,
-                                    'timestamp': datetime.now()
-                                })
-                            return datasource.value
-                        else:
-                            raise ValueError("Data source creation verification failed")
-                            
-                    break  # Success, exit retry loop
-                    
-                except ApiException as e:
-                    if e.status in [408, 429, 500, 502, 503, 504]:  # Retryable errors
-                        if attempt < retry_count - 1:
-                            wait_time = (attempt + 1) * 2  # Exponential backoff
-                            logger.warning(f"Retryable error: {e}. Retrying in {wait_time}s...")
-                            time.sleep(wait_time)
-                            continue
-                    raise  # Last attempt failed or non-retryable error
-                    
-        except Exception as e:
-            logger.error(f"Failed to create data source: {e}")
-            if created_id:
-                self._rollback_data_source_creation(created_id)
-            raise
-
-    def _verify_data_source_creation(self, source_id, name, initial_count):
-        """Comprehensive verification of data source creation"""
-        try:
-            # 1. Verify retrievable
-            retrieved = self.datasources_api.retrieve_data_source(
+            # Create data source
+            datasource = self.datasources_api.create_data_source(
                 container_id=self.container_id,
-                data_source_id=source_id
+                body=request
             )
-            if not retrieved or not hasattr(retrieved, 'value'):
-                logger.error("Failed to retrieve created data source")
-                return False
-                
-            # 2. Verify attributes
-            if retrieved.value.name != name:
-                logger.error(f"Name mismatch: {retrieved.value.name} != {name}")
-                return False
-                
-            # 3. Verify count increased
-            current_sources = self.list_data_sources()
-            if len(current_sources) != initial_count + 1:
-                logger.error(f"Source count mismatch: {len(current_sources)} != {initial_count + 1}")
-                return False
-                
-            # 4. Verify status
-            if not retrieved.value.active:
-                logger.error("Data source is not active")
-                return False
-                
-            logger.debug("All verification checks passed")
-            return True
             
+            # Enhanced verification logging
+            if datasource and hasattr(datasource, 'value'):
+                logger.info(f"✓ Created data source successfully:")
+                logger.info(f"  • Name: {datasource.value.name}")
+                logger.info(f"  • ID: {datasource.value.id}")
+                logger.info(f"  • Type: {datasource.value.adapter_type}")
+                logger.info(f"  • Status: {'Active' if datasource.value.active else 'Inactive'}")
+                logger.info(f"  • Created at: {datasource.value.created_at}")
+                
+                if transaction:
+                    transaction.operations.append({
+                        'type': 'create_data_source',
+                        'result': datasource.value,
+                        'timestamp': datetime.now()
+                    })
+                
+                return datasource.value
+                    
         except Exception as e:
-            logger.error(f"Verification failed: {e}")
-            return False
-
-    def _rollback_data_source_creation(self, source_id):
-        """Rollback a failed data source creation"""
-        try:
-            logger.warning(f"Rolling back data source creation for ID: {source_id}")
-            
-            # First deactivate
-            try:
-                self.datasources_api.set_data_source_inactive(
-                    container_id=self.container_id,
-                    data_source_id=source_id
-                )
-                logger.debug("Data source deactivated")
-            except Exception as e:
-                logger.error(f"Failed to deactivate during rollback: {e}")
-            
-            # Then archive/delete
-            try:
-                self.datasources_api.archive_data_source(
-                    container_id=self.container_id,
-                    data_source_id=source_id,
-                    archive="true",
-                    force_delete="true",
-                    remove_data="true"
-                )
-                logger.info(f"Successfully rolled back data source {source_id}")
-            except Exception as e:
-                logger.error(f"Failed to archive during rollback: {e}")
-                raise
-                
-        except Exception as e:
-            logger.error(f"Rollback failed: {e}")
-            logger.error("Manual cleanup may be required")
+            logger.error(f"Data source creation failed: {str(e)}")
             raise
 
     def create_manual_import(self, source_id, data):
@@ -468,19 +328,36 @@ class DeepLynxTester:
         # Add validation tests
         self.validate_data_source_config(self.test_source_id)
 
-    def test_metatype_operations(self):
-        """Test metatype CRUD operations"""
-        # Create metatype
-        new_metatype = self.create_metatype({
-            "name": "TestMetatype",
-            "description": "Test metatype for integration testing"
-        })
-        
-        # Update metatype
-        self.update_metatype(new_metatype.id, {"description": "Updated description"})
-        
-        # Delete metatype
-        self.delete_metatype(new_metatype.id)
+    def test_metatype_operations(self, transaction=None):
+        """Test metatype creation and management"""
+        try:
+            logger.info("\n=== Testing Metatype Operations ===")
+            
+            # Create metatype
+            metatype_request = {
+                "name": f"test_metatype_{os.urandom(4).hex()}",
+                "description": "Test metatype for integration testing",
+                "container_id": self.container_id
+            }
+            
+            metatype = self.metatypes_api.create_metatype(
+                container_id=self.container_id,
+                body=metatype_request
+            )
+            
+            if transaction:
+                transaction.operations.append({
+                    'type': 'create_metatype',
+                    'result': metatype.value,
+                    'timestamp': datetime.now()
+                })
+            
+            logger.info(f"Created metatype: {metatype.value.name}")
+            return metatype.value
+                
+        except Exception as e:
+            logger.error(f"Metatype operations test failed: {e}")
+            raise
 
     def test_error_handling(self):
         """Test error handling scenarios"""
@@ -709,36 +586,614 @@ class DeepLynxTester:
                 logger.error(f"Container validation failed: {e.body}")
                 return False
 
-def main():
-    """Enhanced main function with transactions and metrics"""
-    tester = DeepLynxTester()
-    
-    try:
-        with tester.transaction("Data Source Creation Test") as transaction:
-            # Validate container first
-            if not tester.validate_container():
-                raise ValueError("Container validation failed")
-
-            # List existing sources
-            initial_sources = tester.list_data_sources()
-            logger.info(f"Found {len(initial_sources)} existing data sources")
+    def test_data_import(self):
+        """Test data import functionality"""
+        try:
+            test_data = [
+                {"id": "test1", "value": 100},
+                {"id": "test2", "value": 200}
+            ]
             
-            # Create new source within transaction
-            new_source = tester.create_data_source(
-                name=f"test_source_{os.urandom(4).hex()}",
-                transaction=transaction
+            import_result = self.datasources_api.create_manual_import(
+                container_id=self.container_id,
+                data_source_id=self.source_id,
+                body=test_data
             )
             
-            # Verify creation
-            current_sources = tester.list_data_sources()
-            if len(current_sources) != len(initial_sources) + 1:
-                raise ValueError("Data source count mismatch after creation")
+            logger.info(f"Data import successful: {len(test_data)} records")
+            return import_result
+            
+        except Exception as e:
+            logger.error(f"Data import failed: {str(e)}")
+            raise
+
+    def test_data_transformations(self, transaction=None):
+        """Test data transformation functionality"""
+        try:
+            logger.info("\n=== Testing Data Transformation Operations ===")
+            
+            # Create source and destination types
+            source_type = self.test_metatype_operations(transaction)
+            dest_type = self.test_metatype_operations(transaction)
+            
+            # Create transformation mapping
+            mapping_request = {
+                "container_id": self.container_id,
+                "source_metatype_id": source_type.id,
+                "destination_metatype_id": dest_type.id,
+                "transformation_name": f"test_transform_{os.urandom(4).hex()}",
+                "conditions": {
+                    "source_field": "name",
+                    "destination_field": "transformed_name",
+                    "transformation": "uppercase"
+                }
+            }
+            
+            mapping = self.type_mappings_api.create_data_type_mapping(
+                container_id=self.container_id,
+                body=mapping_request
+            )
+            
+            if transaction:
+                transaction.operations.append({
+                    'type': 'create_transformation',
+                    'result': mapping.value,
+                    'timestamp': datetime.now()
+                })
                 
-            logger.info("All operations completed successfully")
+            logger.info(f"Created transformation mapping: {mapping.value.transformation_name}")
+            return mapping.value
+            
+        except Exception as e:
+            logger.error(f"Data transformation test failed: {e}")
+            raise
+
+    def test_file_import(self, transaction=None):
+        """Test file import functionality"""
+        try:
+            logger.info("\n=== Testing File Import Operations ===")
+            
+            # Create test file
+            test_file_path = "test_data.json"
+            test_data = [
+                {"id": 1, "name": "Test Item 1", "value": 100},
+                {"id": 2, "name": "Test Item 2", "value": 200}
+            ]
+            with open(test_file_path, 'w') as f:
+                json.dump(test_data, f)
+                
+            try:
+                # Create data source for testing
+                source = self.create_data_source(
+                    name=f"file_import_test_{os.urandom(4).hex()}",
+                    transaction=transaction
+                )
+                
+                # Import file using imports_api
+                with open(test_file_path, 'rb') as file:
+                    import_result = self.imports_api.upload_file(
+                        container_id=self.container_id,
+                        data_source_id=source.id,
+                        file=file,
+                        metadata=json.dumps({
+                            "type": "json",
+                            "mapping": {
+                                "id": "id",
+                                "name": "name",
+                                "value": "value"
+                            }
+                        })
+                    )
+                    
+                logger.info(f"File import initiated: {import_result.value.id}")
+                
+                # Verify import using data_query_api
+                query_result = self.data_query_api.query_data(
+                    container_id=self.container_id,
+                    body={
+                        "data_source_id": source.id,
+                        "limit": 10
+                    }
+                )
+                
+                if len(query_result.value) == len(test_data):
+                    logger.info("File import verification successful")
+                    return import_result.value
+                raise ValueError("Import verification failed")
+                
+            finally:
+                # Cleanup test file
+                if os.path.exists(test_file_path):
+                    os.remove(test_file_path)
+                
+        except Exception as e:
+            logger.error(f"File import test failed: {e}")
+            raise
+
+    def test_data_transformation_pipeline(self, transaction=None):
+        """Test complete data transformation pipeline"""
+        try:
+            logger.info("\n=== Testing Data Transformation Pipeline ===")
+            
+            # 1. Create metatypes for source and destination
+            source_metatype = self.metatypes_api.create_metatype(
+                container_id=self.container_id,
+                body={
+                    "name": f"source_type_{os.urandom(4).hex()}",
+                    "description": "Source data type",
+                    "properties": {
+                        "name": {"type": "string", "required": True},
+                        "value": {"type": "number", "required": True}
+                    }
+                }
+            )
+            
+            dest_metatype = self.metatypes_api.create_metatype(
+                container_id=self.container_id,
+                body={
+                    "name": f"transformed_type_{os.urandom(4).hex()}",
+                    "description": "Transformed data type",
+                    "properties": {
+                        "transformed_name": {"type": "string", "required": True},
+                        "doubled_value": {"type": "number", "required": True}
+                    }
+                }
+            )
+            
+            # 2. Create transformation mapping
+            mapping = self.type_mappings_api.create_data_type_mapping(
+                container_id=self.container_id,
+                body={
+                    "name": f"test_transform_{os.urandom(4).hex()}",
+                    "source_metatype_id": source_metatype.value.id,
+                    "destination_metatype_id": dest_metatype.value.id,
+                    "transformations": [
+                        {
+                            "source_field": "name",
+                            "destination_field": "transformed_name",
+                            "transformation": "uppercase"
+                        },
+                        {
+                            "source_field": "value",
+                            "destination_field": "doubled_value",
+                            "transformation": "multiply",
+                            "transformation_args": {"factor": 2}
+                        }
+                    ]
+                }
+            )
+            
+            if transaction:
+                transaction.operations.append({
+                    'type': 'create_transformation_pipeline',
+                    'result': {
+                        'source_metatype': source_metatype.value,
+                        'dest_metatype': dest_metatype.value,
+                        'mapping': mapping.value
+                    },
+                    'timestamp': datetime.now()
+                })
+            
+            logger.info(f"Created transformation pipeline: {mapping.value.name}")
+            return mapping.value
+            
+        except Exception as e:
+            logger.error(f"Transformation pipeline test failed: {e}")
+            raise
+
+    def test_complete_pipeline(self):
+        """Test complete data pipeline with import and transformation"""
+        try:
+            with self.transaction("Complete Pipeline Test") as transaction:
+                # 1. Create data source
+                source = self.create_data_source(
+                    name=f"pipeline_test_{os.urandom(4).hex()}",
+                    transaction=transaction
+                )
+                
+                # 2. Create test data
+                test_data = [
+                    {
+                        "id": "test1",
+                        "name": "Test Record 1",
+                        "value": 100,
+                        "metadata": {"category": "A"}
+                    },
+                    {
+                        "id": "test2",
+                        "name": "Test Record 2",
+                        "value": 200,
+                        "metadata": {"category": "B"}
+                    }
+                ]
+                
+                # 3. Import data
+                import_result = self.datasources_api.create_manual_import(
+                    container_id=self.container_id,
+                    data_source_id=source.id,
+                    body=test_data
+                )
+                
+                # 4. Query and validate imported data
+                query_result = self.data_query_api.query_data(
+                    container_id=self.container_id,
+                    body={
+                        "data_source_id": source.id,
+                        "query": {
+                            "value": {"$gt": 150}  # Query records with value > 150
+                        }
+                    }
+                )
+                
+                # 5. Create and apply transformation
+                transform_result = self.test_data_transformations(transaction)
+                
+                # 6. Verify transformed data
+                transformed_data = self.data_query_api.query_data(
+                    container_id=self.container_id,
+                    body={
+                        "metatype_id": transform_result.destination_metatype_id,
+                        "query": {
+                            "doubled_value": {"$gt": 300}  # Verify transformation
+                        }
+                    }
+                )
+                
+                return {
+                    "source": source,
+                    "import": import_result.value,
+                    "query": query_result.value,
+                    "transform": transform_result,
+                    "transformed_data": transformed_data.value
+                }
+                
+        except Exception as e:
+            logger.error(f"Complete pipeline test failed: {e}")
+            raise
+
+    def validate_data_integrity(self, original_data, imported_data):
+        """Validate data integrity after import"""
+        try:
+            # Check record counts
+            if len(original_data) != len(imported_data):
+                raise ValueError(f"Data count mismatch: {len(original_data)} vs {len(imported_data)}")
+                
+            # Check data fields
+            for orig, imp in zip(original_data, imported_data):
+                for key in orig.keys():
+                    if orig[key] != imp.get(key):
+                        raise ValueError(f"Data mismatch for key {key}: {orig[key]} vs {imp.get(key)}")
+                        
+            logger.info("Data integrity validation successful")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Data integrity validation failed: {e}")
+            raise
+
+    def test_error_handling(self):
+        """Test error handling and recovery"""
+        try:
+            with self.transaction("Error Handling Test") as transaction:
+                # Test invalid data source creation
+                with pytest.raises(ValueError):
+                    self.create_data_source(name="", transaction=transaction)
+                    
+                # Test duplicate data source
+                source = self.create_data_source(
+                    name="duplicate_test",
+                    transaction=transaction
+                )
+                with pytest.raises(ApiException):
+                    self.create_data_source(name="duplicate_test")
+                    
+                # Test invalid data import
+                with pytest.raises(ValueError):
+                    self.datasources_api.create_manual_import(
+                        container_id=self.container_id,
+                        data_source_id=source.id,
+                        body={"invalid": "data"}
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Error handling test failed: {e}")
+            raise
+
+    def test_data_source_functionality(self):
+        """Test complete data source functionality"""
+        try:
+            # 1. Create data source
+            source = self.create_data_source()
+            
+            # 2. Test data import
+            test_data = [{"id": "test1", "value": 100}]
+            import_result = self.datasources_api.create_manual_import(
+                container_id=self.container_id,
+                data_source_id=source.id,
+                body=test_data
+            )
+            logger.info(f"Data import result: {import_result.value}")
+            
+            # 3. Test data query
+            query_result = self.data_query_api.query_data(
+                container_id=self.container_id,
+                body={"data_source_id": source.id}
+            )
+            logger.info(f"Query result: {query_result.value}")
+            
+            return {
+                "source": source,
+                "import": import_result.value,
+                "query": query_result.value
+            }
+            
+        except Exception as e:
+            logger.error(f"Functionality test failed: {str(e)}")
+            raise
+
+    def validate_data_source_config(self, config: deep_lynx.DataSourceConfig) -> bool:
+        """Validate data source configuration against API model"""
+        try:
+            required_fields = {
+                'data_format': str,
+                'kind': str,
+                'data_type': str
+            }
+            
+            # Check required fields and types
+            for field, field_type in required_fields.items():
+                if not hasattr(config, field):
+                    logger.error(f"Missing required field: {field}")
+                    return False
+                if not isinstance(getattr(config, field), field_type):
+                    logger.error(f"Invalid type for {field}: expected {field_type}")
+                    return False
+                    
+            # Validate allowed values
+            allowed_formats = ['json', 'csv', 'xml']
+            allowed_kinds = ['manual', 'automatic', 'scheduled']
+            
+            if config.data_format not in allowed_formats:
+                logger.error(f"Invalid data_format: {config.data_format}")
+                return False
+                
+            if config.kind not in allowed_kinds:
+                logger.error(f"Invalid kind: {config.kind}")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Configuration validation failed: {str(e)}")
+            return False
+
+    def cleanup_test_sources(self):
+        """Clean up test data sources"""
+        try:
+            sources = self.list_data_sources()
+            test_sources = [s for s in sources if s.name.startswith('test_source_')]
+            
+            for source in test_sources:
+                logger.info(f"Cleaning up test source: {source.name}")
+                self.datasources_api.archive_data_source(
+                    container_id=self.container_id,
+                    data_source_id=source.id,
+                    archive="true",
+                    force_delete="true",
+                    remove_data="true"
+                )
+                
+            logger.info(f"Cleaned up {len(test_sources)} test sources")
+            
+        except Exception as e:
+            logger.error(f"Cleanup failed: {str(e)}")
+
+    def upload_and_attach_file(self, data_node_id: str, file_path: str, metadata: dict = None):
+        """Upload a file and attach it to a data node"""
+        try:
+            logger.info(f"Uploading file {file_path} for node {data_node_id}")
+            
+            # Verify file exists
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+                
+            # Prepare metadata properly
+            file_metadata = {
+                "data_node_id": data_node_id,
+                "file_type": "pdf"
+            }
+            
+            # Merge additional metadata if provided
+            if metadata:
+                file_metadata.update(metadata)
+                
+            # Upload file
+            with open(file_path, 'rb') as file:
+                response = self.datasources_api.upload_file(
+                    container_id=self.container_id,
+                    data_source_id=self.data_source_id,
+                    file=file,
+                    metadata=json.dumps(file_metadata)  # Use the merged metadata
+                )
+                
+                logger.info(f"✓ File uploaded successfully:")
+                logger.info(f"  • File ID: {response.value.id}")
+                logger.info(f"  • Node ID: {data_node_id}")
+                logger.info(f"  • File name: {os.path.basename(file_path)}")
+                
+                return response.value
+                
+        except Exception as e:
+            logger.error(f"File upload failed: {str(e)}")
+            raise
+
+    def test_file_upload(self):
+        """Test file upload functionality"""
+        try:
+            with DeepLynxTransaction(self, "File Upload Test") as transaction:
+                # 1. Create test data node
+                test_data = {
+                    "name": "Test Document",
+                    "type": "document",
+                    "properties": {
+                        "description": "Test PDF document"
+                    }
+                }
+                
+                node = self.create_data_node(test_data)
+                
+                # 2. Upload and attach PDF
+                file_path = "path/to/your/test.pdf"
+                metadata = {
+                    "description": "Test document upload",
+                    "version": "1.0"
+                }
+                
+                file_info = self.upload_and_attach_file(
+                    data_node_id=node.id,
+                    file_path=file_path,
+                    metadata=metadata
+                )
+                
+                # 3. Verify attachment
+                node_with_files = self.get_data_node(node.id)
+                logger.info(f"✓ File attachment verified:")
+                logger.info(f"  • Node: {node.id}")
+                logger.info(f"  • Files: {len(node_with_files.files)}")
+                
+                return {
+                    "node": node,
+                    "file": file_info
+                }
+                
+        except Exception as e:
+            logger.error(f"File upload test failed: {str(e)}")
+            raise
+
+    def test_pdf_upload(self):
+        """
+        Test PDF file upload functionality
+        Goal: Upload a PDF file to Deep Lynx and associate it with a data node
+        Steps:
+        1. Create a data source for PDF files
+        2. Create a data node (or use existing)
+        3. Upload PDF and attach to node
+        4. Verify upload success
+        """
+        try:
+            with self.transaction("PDF Upload Test") as transaction:
+                logger.info("\n=== Starting PDF Upload Test ===")
+                
+                # Debug environment
+                logger.debug("\n=== Environment Info ===")
+                logger.debug(f"Current working directory: {os.getcwd()}")
+                logger.debug(f"API Client Configuration:")
+                logger.debug(f"  Host: {self.api_client.configuration.host}")
+                logger.debug(f"  APIs initialized: {hasattr(self, 'imports_api')}")
+                
+                # Create data source
+                source = self.create_data_source(
+                    name=f"pdf_source_{os.urandom(4).hex()}",
+                    transaction=transaction
+                )
+                
+                # File handling with detailed debugging
+                pdf_path = os.path.join(os.path.dirname(__file__), "..", "testPDF.pdf")
+                abs_path = os.path.abspath(pdf_path)
+                
+                logger.debug("\n=== File Information ===")
+                logger.debug(f"PDF path: {abs_path}")
+                logger.debug(f"File exists: {os.path.exists(abs_path)}")
+                logger.debug(f"File size: {os.path.getsize(abs_path)} bytes")
+                logger.debug(f"File permissions: {oct(os.stat(abs_path).st_mode)[-3:]}")
+                
+                try:
+                    with open(abs_path, 'rb') as file:
+                        # Prepare metadata
+                        metadata = {
+                            "filename": "testPDF.pdf",
+                            "mime_type": "application/pdf",
+                            "size": os.path.getsize(abs_path),
+                            "source": "test_upload",
+                            "description": "Test PDF document upload"
+                        }
+                        
+                        logger.debug("\n=== Upload Attempt ===")
+                        logger.debug(f"Data source ID: {source.id}")
+                        logger.debug(f"Metadata: {json.dumps(metadata, indent=2)}")
+                        
+                        # Attempt upload
+                        upload_result = self.imports_api.upload_file(
+                            container_id=self.container_id,
+                            data_source_id=source.id,
+                            file=file,
+                            metadata=json.dumps(metadata)
+                        )
+                        
+                        logger.debug("\n=== Upload Result ===")
+                        logger.debug(f"Result: {upload_result}")
+                        
+                        return {
+                            'node': upload_result.value,
+                            'file': upload_result.value.file,
+                            'file_path': upload_result.value.file_path
+                        }
+                        
+                except Exception as e:
+                    logger.error("\n=== Upload Error ===")
+                    logger.error(f"Error type: {type(e).__name__}")
+                    logger.error(f"Error message: {str(e)}")
+                    logger.error("Stack trace:", exc_info=True)
+                    raise
+                
+        except Exception as e:
+            logger.error(f"PDF upload test failed: {str(e)}")
+            raise
+
+def main():
+    """Main test execution function with enhanced error handling"""
+    try:
+        # Load environment variables
+        load_dotenv()
+        
+        # Get configuration from environment with fallbacks
+        host = os.getenv('DEEP_LYNX_URL', 'http://localhost:8090')
+        container_id = os.getenv('DEEP_LYNX_CONTAINER_ID', '2')
+        
+        logger.info("\n=== PDF Upload Test Configuration ===")
+        logger.info(f"Host: {host}")
+        logger.info(f"Container ID: {container_id}")
+        
+        # Initialize tester with validated parameters
+        tester = DeepLynxTester(
+            host=host,
+            container_id=container_id
+        )
+        
+        # ONLY run the PDF upload test
+        logger.info("\n=== Starting PDF Upload Test ===")
+        pdf_result = tester.test_pdf_upload()
+        
+        # Log the results
+        logger.info("\n=== PDF Upload Results ===")
+        logger.info(f"✓ PDF upload completed successfully")
+        logger.info(f"  • Node ID: {pdf_result['node'].id if pdf_result.get('node') else 'N/A'}")
+        logger.info(f"  • File ID: {pdf_result['file'].id if pdf_result.get('file') else 'N/A'}")
+        logger.info(f"  • File path: {pdf_result.get('file_path', 'N/A')}")
             
     except Exception as e:
-        logger.error(f"Test failed: {e}")
-        raise
+        logger.error(f"\nTest failed with error:")
+        logger.error(f"  • Error type: {type(e).__name__}")
+        logger.error(f"  • Error message: {str(e)}")
+        logger.error(f"  • Stack trace:", exc_info=True)
+        sys.exit(1)
+    finally:
+        logger.info("\n=== Test Complete ===\n")
 
 if __name__ == "__main__":
+    # Configure logging format for better readability
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s'  # Simplified format for cleaner output
+    )
     main() 
