@@ -13,3 +13,5 @@ httpx>=0.24.1
 requests>=2.31.0
 pydantic>=2.7.0
 fpdf2==2.7.6
+prometheus_client>=0.15.0  # Add this line
+urllib3>=2.0.0  # Ensure this is included
