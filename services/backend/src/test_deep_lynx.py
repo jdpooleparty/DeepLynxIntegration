@@ -16,6 +16,7 @@ import json
 from prometheus_client import Counter, Histogram, start_http_server
 import pytest
 import sys #important for pytest
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 OPERATION_COUNTER = Counter('deep_lynx_operations_total', 'Total operations by type', ['operation_type'])
 OPERATION_DURATION = Histogram('deep_lynx_operation_duration_seconds', 'Operation duration in seconds', ['operation_type'])
 ERROR_COUNTER = Counter('deep_lynx_errors_total', 'Total errors by type', ['error_type'])
+IMPORT_DURATION = Histogram(
+    'deep_lynx_import_duration_seconds',
+    'Import operation duration in seconds'
+)
+IMPORT_STATUS_COUNTER = Counter(
+    'deep_lynx_import_status_total',
+    'Import status counts',
+    ['status']
+)
 
 @dataclass
 class OperationMetrics:
@@ -131,11 +141,14 @@ class DeepLynxTester:
         self.imports_api = deep_lynx.ImportsApi(self.api_client)
         self.data_query_api = deep_lynx.DataQueryApi(self.api_client)
         self.containers_api = deep_lynx.ContainersApi(self.api_client)
+        self.metatypes_api = deep_lynx.MetatypesApi(self.api_client)
         
         # Debug API initialization
         logger.debug("\n=== API Initialization ===")
         logger.debug(f"APIs initialized: auth, datasources, imports, data_query, containers")
         logger.debug(f"Auth string length: {len(auth_str) if auth_str else 0}")
+        
+        self.import_history = {}  # Track import status history
         
     def check_health(self) -> bool:
         """Check system health before operations"""
@@ -288,7 +301,7 @@ class DeepLynxTester:
                 name=name,
                 adapter_type="standard",
                 active=True,
-                config=deep_lynx.DataSourceConfig(  # Using correct parameters from API model
+                config=deep_lynx.DataSourceConfig(
                     kind="manual",
                     data_type="json",
                     data_format="json"
@@ -345,15 +358,30 @@ class DeepLynxTester:
             raise
 
     def list_metatypes(self):
-        """List all metatypes in container 1"""
+        """List all metatypes in container"""
         try:
-            metatypes = self.metatypes_api.list_metatypes(self.container_id)
-            logger.info(f"Found {len(metatypes.value)} metatypes")
-            for metatype in metatypes.value:
-                logger.info(f"Metatype: {metatype.name} (ID: {metatype.id})")
-            return metatypes.value
-        except ApiException as e:
-            logger.error(f"Failed to list metatypes: {e}")
+            logger.info("\n=== Listing Available Metatypes ===")
+            metatypes = self.metatypes_api.list_metatypes(
+                container_id=self.container_id
+            )
+            
+            if hasattr(metatypes, 'value'):
+                logger.info(f"Found {len(metatypes.value)} metatypes")
+                document_metatype = next(
+                    (m for m in metatypes.value if m.name.lower() == 'document'), 
+                    None
+                )
+                if document_metatype:
+                    logger.debug(f"Document metatype ID: {document_metatype.id}")
+                return metatypes.value
+            else:
+                logger.warning("No metatypes found or unexpected response format")
+                logger.debug(f"Response type: {type(metatypes)}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Failed to list metatypes: {str(e)}")
+            logger.debug("Stack trace:", exc_info=True)
             raise
 
     def check_server_health(self):
@@ -470,19 +498,18 @@ class DeepLynxTester:
             logger.error(f"Failed to update data source: {e}")
             raise
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def delete_data_source(self, source_id):
-        """Delete a data source with safety checks"""
+        """Improved data source deletion with verification"""
         try:
-            logger.debug(f"Deleting data source {source_id}")
-            
-            # First deactivate the source
+            # First try to set inactive
             self.datasources_api.set_data_source_inactive(
                 container_id=self.container_id,
                 data_source_id=source_id
             )
             
-            # Then archive it
-            response = self.datasources_api.archive_data_source(
+            # Then archive and delete
+            self.datasources_api.archive_data_source(
                 container_id=self.container_id,
                 data_source_id=source_id,
                 archive="true",
@@ -490,22 +517,26 @@ class DeepLynxTester:
                 remove_data="true"
             )
             
-            # Verify deletion
-            try:
-                self.datasources_api.retrieve_data_source(
-                    container_id=self.container_id,
-                    data_source_id=source_id
-                )
-                logger.error(f"Data source {source_id} still exists after deletion")
-                raise ValueError("Deletion verification failed")
-            except ApiException as e:
-                if e.status == 404:
-                    logger.info(f"Successfully deleted data source {source_id}")
-                    return True
-                raise
+            # Verify deletion with retries
+            max_verify_attempts = 3
+            for attempt in range(max_verify_attempts):
+                try:
+                    self.datasources_api.retrieve_data_source(
+                        container_id=self.container_id,
+                        data_source_id=source_id
+                    )
+                    if attempt < max_verify_attempts - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                    raise Exception("Data source still exists")
+                except ApiException as e:
+                    if e.status == 404:
+                        logger.info(f"✓ Data source {source_id} deleted successfully")
+                        return True
+                    raise
                 
         except Exception as e:
-            logger.error(f"Failed to delete data source: {e}")
+            logger.error(f"Failed to delete data source {source_id}: {e}")
             raise
 
     def create_metatype(self, config: dict):
@@ -1038,6 +1069,41 @@ class DeepLynxTester:
         except Exception as e:
             logger.error(f"Cleanup failed: {str(e)}")
 
+    def create_data_node(self, data):
+        """Create a data node"""
+        try:
+            response = self.datasources_api.create_manual_import(
+                container_id=self.container_id,
+                data_source_id=self.data_source_id,
+                body={"data": [data]}
+            )
+            
+            if response and hasattr(response, 'value'):
+                logger.info(f"Created node with ID: {response.value.id}")
+                return response.value
+            raise ValueError("Invalid response from create_data_node")
+                
+        except Exception as e:
+            logger.error(f"Failed to create data node: {e}")
+            raise
+
+    def get_data_node(self, node_id):
+        """Get a data node by ID"""
+        try:
+            response = self.data_query_api.retrieve_data(
+                container_id=self.container_id,
+                data_source_id=self.data_source_id,
+                data_id=node_id
+            )
+            
+            if response and hasattr(response, 'value'):
+                return response.value
+            raise ValueError("Invalid response from get_data_node")
+                
+        except Exception as e:
+            logger.error(f"Failed to get data node: {e}")
+            raise
+
     def upload_and_attach_file(self, data_node_id: str, file_path: str, metadata: dict = None):
         """Upload a file and attach it to a data node"""
         try:
@@ -1062,13 +1128,13 @@ class DeepLynxTester:
                 response = self.datasources_api.upload_file(
                     container_id=self.container_id,
                     data_source_id=self.data_source_id,
-                    file=file,
-                    metadata=json.dumps(file_metadata)  # Use the merged metadata
+                    file=file_path,  # Changed from file to file_path
+                    metadata=json.dumps(file_metadata)
                 )
                 
                 logger.info(f"✓ File uploaded successfully:")
                 logger.info(f"  • File ID: {response.value.id}")
-                logger.info(f"  • Node ID: {data_node_id}")
+                logger.info(f"   Node ID: {data_node_id}")
                 logger.info(f"  • File name: {os.path.basename(file_path)}")
                 
                 return response.value
@@ -1121,83 +1187,210 @@ class DeepLynxTester:
             raise
 
     def test_pdf_upload(self):
-        """
-        Test PDF file upload functionality
-        Goal: Upload a PDF file to Deep Lynx and associate it with a data node
-        Steps:
-        1. Create a data source for PDF files
-        2. Create a data node (or use existing)
-        3. Upload PDF and attach to node
-        4. Verify upload success
-        """
+        """Test PDF file upload functionality"""
         try:
             with self.transaction("PDF Upload Test") as transaction:
-                logger.info("\n=== Starting PDF Upload Test ===")
+                # First list existing Document nodes
+                existing_nodes = self.list_nodes(metatype_name="Document")
+                target_node = None
                 
-                # Debug environment
-                logger.debug("\n=== Environment Info ===")
-                logger.debug(f"Current working directory: {os.getcwd()}")
-                logger.debug(f"API Client Configuration:")
-                logger.debug(f"  Host: {self.api_client.configuration.host}")
-                logger.debug(f"  APIs initialized: {hasattr(self, 'imports_api')}")
+                if existing_nodes:
+                    target_node = existing_nodes[0]
+                    logger.info(f"Using existing node: {target_node.id}")
+                else:
+                    logger.info("No existing Document nodes found, creating new one...")
                 
                 # Create data source
-                source = self.create_data_source(
-                    name=f"pdf_source_{os.urandom(4).hex()}",
-                    transaction=transaction
+                source = self.create_data_source("pdf_source")
+                logger.info("\n=== Data Source Details ===")
+                logger.info(f"  • Source ID: {source.id}")
+                
+                # Now upload PDF to the node
+                logger.info("\n=== Uploading PDF File ===")
+                file_path = os.path.join(os.path.dirname(__file__), "..", "testPDF.pdf")
+                logger.info(f"Using PDF file: {file_path}")
+                
+                # Verify file exists before upload
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"PDF file not found at: {file_path}")
+                
+                # Create form data
+                files = {
+                    'file': ('testPDF.pdf', open(file_path, 'rb'), 'application/pdf')
+                }
+                form_data = {
+                    'metadata': json.dumps({
+                        "node_id": target_node.id if target_node else None,
+                        "description": "Test PDF upload"
+                    })
+                }
+
+                response = self.datasources_api.upload_file(
+                    container_id=self.container_id,
+                    data_source_id=source.id,
+                    files=files,
+                    **form_data
                 )
                 
-                # File handling with detailed debugging
-                pdf_path = os.path.join(os.path.dirname(__file__), "..", "testPDF.pdf")
-                abs_path = os.path.abspath(pdf_path)
+                if not response or not hasattr(response, 'value'):
+                    raise ValueError("Invalid response from file upload")
                 
-                logger.debug("\n=== File Information ===")
-                logger.debug(f"PDF path: {abs_path}")
-                logger.debug(f"File exists: {os.path.exists(abs_path)}")
-                logger.debug(f"File size: {os.path.getsize(abs_path)} bytes")
-                logger.debug(f"File permissions: {oct(os.stat(abs_path).st_mode)[-3:]}")
+                logger.info(f"✓ File uploaded successfully")
+                logger.info(f"  • Node ID: {target_node.id if target_node else 'None'}")
+                logger.info(f"  • File ID: {response.value.id}")
                 
-                try:
-                    with open(abs_path, 'rb') as file:
-                        # Prepare metadata
-                        metadata = {
-                            "filename": "testPDF.pdf",
-                            "mime_type": "application/pdf",
-                            "size": os.path.getsize(abs_path),
-                            "source": "test_upload",
-                            "description": "Test PDF document upload"
-                        }
-                        
-                        logger.debug("\n=== Upload Attempt ===")
-                        logger.debug(f"Data source ID: {source.id}")
-                        logger.debug(f"Metadata: {json.dumps(metadata, indent=2)}")
-                        
-                        # Changed create_file to upload_file
-                        upload_result = self.datasources_api.upload_file(
-                            container_id=self.container_id,
-                            data_source_id=source.id,
-                            file=file,
-                            metadata=json.dumps(metadata)
-                        )
-                        
-                        logger.debug("\n=== Upload Result ===")
-                        logger.debug(f"Result: {upload_result}")
-                        
-                        return {
-                            'node': upload_result.value,
-                            'file': upload_result.value.file,
-                            'file_path': upload_result.value.file_path
-                        }
-                        
-                except Exception as e:
-                    logger.error("\n=== Upload Error ===")
-                    logger.error(f"Error type: {type(e).__name__}")
-                    logger.error(f"Error message: {str(e)}")
-                    logger.error("Stack trace:", exc_info=True)
-                    raise
+                return {
+                    'node_id': target_node.id if target_node else None,
+                    'file': response.value,
+                    'file_path': file_path
+                }
                 
         except Exception as e:
             logger.error(f"PDF upload test failed: {str(e)}")
+            raise
+
+    def track_import_status(self, import_id: str, status: dict):
+        """Track import status changes"""
+        if import_id not in self.import_history:
+            self.import_history[import_id] = []
+        self.import_history[import_id].append({
+            'timestamp': datetime.now().isoformat(),
+            'status': status
+        })
+        
+    def get_import_history(self, import_id: str) -> list:
+        """Get history for specific import"""
+        return self.import_history.get(import_id, [])
+
+    # Constants for different file types
+    TIMEOUT_CONFIG = {
+        'pdf': {
+            'timeout': 120,  # 2 minutes for PDFs
+            'check_interval': 5
+        },
+        'default': {
+            'timeout': 60,
+            'check_interval': 2
+        }
+    }
+
+    def wait_for_import(self, container_id, source_id, import_id, file_type='default'):
+        """Wait for import with configurable timeouts"""
+        config = self.TIMEOUT_CONFIG.get(file_type, self.TIMEOUT_CONFIG['default'])
+        start_time = time.time()
+        attempt = 0
+        
+        while time.time() - start_time < config['timeout']:
+            attempt += 1
+            try:
+                import_list = self.datasources_api.list_imports_for_data_source(
+                    container_id=container_id,
+                    data_source_id=source_id
+                )
+                
+                # We're only checking records_inserted > 0
+                if records > 0:
+                    return import_item
+                
+            except Exception as e:
+                logger.error(f"Error checking import status: {e}")
+                logger.debug("Error details:", exc_info=True)
+                raise
+                
+        # Timeout occurred - log final status
+        elapsed = time.time() - start_time
+        logger.error(f"\nImport timed out after {elapsed:.1f}s")
+        logger.error("\nFinal Import History:")
+        for entry in self.get_import_history(str(import_id)):
+            logger.error(f"  • {entry['timestamp']}: {entry['status']['status']}")
+        
+        raise TimeoutError(f"Import did not complete within {config['timeout']} seconds")
+
+    def check_import_status(self, import_item):
+        """Enhanced import status checking"""
+        status = getattr(import_item, 'status', None)
+        if not status:
+            logger.debug(f"Import item has no status: {vars(import_item)}")
+            return False
+        
+        status = status.lower()
+        logger.debug(f"Import status: {status}")
+        
+        status_map = {
+            'completed': True,
+            'processing': False,
+            'queued': False,
+            'pending': False,
+            'failed': lambda: self._handle_failed_import(import_item),
+            'error': lambda: self._handle_failed_import(import_item)
+        }
+        
+        if status not in status_map:
+            logger.warning(f"Unknown status: {status}")
+            return False
+        
+        handler = status_map[status]
+        return handler() if callable(handler) else handler
+        
+    def _handle_failed_import(self, import_item):
+        """Handle failed import with detailed error reporting"""
+        error = getattr(import_item, 'error', 'Unknown error')
+        error_details = getattr(import_item, 'error_details', {})
+        
+        logger.error(f"Import failed:")
+        logger.error(f"  • Error: {error}")
+        logger.error(f"  • Details: {error_details}")
+        logger.error(f"  • Created At: {getattr(import_item, 'created_at', 'unknown')}")
+        logger.error(f"  • Updated At: {getattr(import_item, 'updated_at', 'unknown')}")
+        
+        raise Exception(f"Import failed: {error}")
+
+    def list_nodes(self, metatype_name=None):
+        """List existing nodes, optionally filtered by metatype"""
+        try:
+            logger.info("\n=== Listing Existing Nodes ===")
+            
+            # GraphQL query to get nodes
+            query = """
+            query {
+                nodes {
+                    id
+                    metatype_name
+                    created_at
+                    properties
+                }
+            }
+            """
+            
+            # Use the correct method from Data Query API
+            nodes = self.data_query_api.data_query(
+                container_id=self.container_id,
+                body={"query": query}  # GraphQL query must be wrapped in dict
+            )
+            
+            if hasattr(nodes, 'value'):
+                logger.info(f"Found {len(nodes.value)} nodes")
+                
+                # Debug log all nodes
+                for node in nodes.value:
+                    logger.debug("\nNode Details:")
+                    logger.debug(f"  • ID: {node.id}")
+                    logger.debug(f"  • Metatype: {getattr(node, 'metatype_name', 'unknown')}")
+                    logger.debug(f"  • Created: {getattr(node, 'created_at', 'unknown')}")
+                    
+                    # If we're looking for specific metatype
+                    if metatype_name and getattr(node, 'metatype_name', '').lower() == metatype_name.lower():
+                        logger.info(f"Found matching node: {node.id}")
+                        
+                return nodes.value
+            else:
+                logger.warning("No nodes found or unexpected response format")
+                logger.debug(f"Response type: {type(nodes)}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Failed to list nodes: {str(e)}")
+            logger.debug("Error details:", exc_info=True)
             raise
 
 def main():
@@ -1227,7 +1420,7 @@ def main():
         # Log the results
         logger.info("\n=== PDF Upload Results ===")
         logger.info(f"✓ PDF upload completed successfully")
-        logger.info(f"  • Node ID: {pdf_result['node'].id if pdf_result.get('node') else 'N/A'}")
+        logger.info(f"  • Node ID: {pdf_result['node_id'] if pdf_result.get('node_id') else 'N/A'}")
         logger.info(f"  • File ID: {pdf_result['file'].id if pdf_result.get('file') else 'N/A'}")
         logger.info(f"  • File path: {pdf_result.get('file_path', 'N/A')}")
             
