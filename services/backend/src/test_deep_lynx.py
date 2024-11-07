@@ -88,15 +88,29 @@ class DeepLynxTransaction:
 class DeepLynxTester:
     def __init__(self, host: str, container_id: str):
         """Initialize the tester with Deep Lynx configuration"""
+        # Load environment variables from correct path
+        env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+        load_dotenv(env_path)
+        
         # Debug initialization state
         logger.info("\n=== Initializing Deep Lynx Tester ===")
         logger.info(f"Host: {host}")
-        logger.info(f"API Key: {os.getenv('DEEP_LYNX_API_KEY')}")
-        logger.info(f"API Secret: {os.getenv('DEEP_LYNX_API_SECRET')}")
+        logger.info(f"Environment file path: {env_path}")
+        logger.info(f"Environment file exists: {os.path.exists(env_path)}")
+        
+        # Debug environment variables
+        logger.debug("Environment Variables:")
+        logger.debug(f"DEEP_LYNX_URL: {os.getenv('DEEP_LYNX_URL')}")
+        logger.debug(f"DEEP_LYNX_API_KEY: {'SET' if os.getenv('DEEP_LYNX_API_KEY') else 'NOT SET'}")
+        logger.debug(f"DEEP_LYNX_API_SECRET: {'SET' if os.getenv('DEEP_LYNX_API_SECRET') else 'NOT SET'}")
+        logger.debug(f"DEEP_LYNX_CONTAINER_ID: {os.getenv('DEEP_LYNX_CONTAINER_ID')}")
         
         # Store credentials
         self.api_key = os.getenv('DEEP_LYNX_API_KEY')
         self.api_secret = os.getenv('DEEP_LYNX_API_SECRET')
+        
+        if not self.api_key or not self.api_secret:
+            raise ValueError("API key and secret must be set in environment variables")
         
         # Initialize configuration properly
         self.configuration = deep_lynx.Configuration()
@@ -110,6 +124,9 @@ class DeepLynxTester:
         # Initialize API client and APIs
         self.api_client = deep_lynx.ApiClient(self.configuration)
         self.container_id = container_id
+        
+        # Initialize all required APIs
+        self.auth_api = deep_lynx.AuthenticationApi(self.api_client)
         self.datasources_api = deep_lynx.DataSourcesApi(self.api_client)
         self.imports_api = deep_lynx.ImportsApi(self.api_client)
         self.data_query_api = deep_lynx.DataQueryApi(self.api_client)
@@ -117,16 +134,33 @@ class DeepLynxTester:
         
         # Debug API initialization
         logger.debug("\n=== API Initialization ===")
-        logger.debug(f"APIs initialized: datasources, imports, data_query, containers")
-        logger.debug(f"Auth string: {auth_str}")
+        logger.debug(f"APIs initialized: auth, datasources, imports, data_query, containers")
+        logger.debug(f"Auth string length: {len(auth_str) if auth_str else 0}")
         
     def check_health(self) -> bool:
         """Check system health before operations"""
         try:
+            # First ensure we're authenticated
+            if not self.authenticate():
+                logger.error("Authentication failed during health check")
+                return False
+
+            # Debug logging to verify authentication headers
+            logger.debug(f"Using headers: {self.api_client.default_headers}")
+            
             # Verify container exists
-            container = self.containers_api.retrieve_container(self.container_id)
-            logger.info(f"Successfully validated container {self.container_id}")
-            return True
+            try:
+                container = self.containers_api.retrieve_container(self.container_id)
+                logger.info(f"Successfully validated container {self.container_id}")
+                return True
+            except ApiException as e:
+                logger.error(f"Container validation failed: Status {e.status}, Body: {e.body}")
+                if e.status == 401:
+                    # Try re-authenticating once
+                    logger.info("Attempting to re-authenticate...")
+                    if self.authenticate():
+                        return self.check_health()
+                return False
         except Exception as e:
             logger.error(f"Health check failed: {str(e)}")
             return False
@@ -170,28 +204,44 @@ class DeepLynxTester:
         """Authenticate with Deep Lynx"""
         try:
             logger.info("Attempting authentication with Deep Lynx...")
-            logger.info(f"Host: {self.configuration.host}")
-            logger.info(f"API Key: {self.api_key}")
-            logger.info(f"API Secret: {self.api_secret}")
+            
+            # Debug logging
+            logger.debug(f"Host: {self.configuration.host}")
+            logger.debug(f"API Key length: {len(self.api_key) if self.api_key else 0}")
+            logger.debug(f"API Secret length: {len(self.api_secret) if self.api_secret else 0}")
             
             # Make authentication request
-            logger.info(f"Making request to: {self.configuration.host}/oauth/token")
-            logger.info(f"With headers: {self.api_client.default_headers}")
-            
-            token_response = self.auth_api.retrieve_o_auth_token(
-                x_api_key=self.api_key,
-                x_api_secret=self.api_secret
-            )
-            
-            # Update headers with token
-            self.api_client.default_headers['Authorization'] = f"Bearer {token_response}"
-            
-            logger.info("Successfully authenticated with Deep Lynx")
-            logger.info(f"Response status: 200")
-            logger.info(f"Response text: {token_response}")
-            
-            return True
-            
+            try:
+                token_response = self.auth_api.retrieve_o_auth_token(
+                    x_api_key=self.api_key,
+                    x_api_secret=self.api_secret
+                )
+                
+                # Debug the response
+                logger.debug(f"Token response type: {type(token_response)}")
+                logger.debug(f"Token response: {token_response}")
+                
+                # Handle different response types
+                if isinstance(token_response, str):
+                    token = token_response
+                elif hasattr(token_response, 'value'):
+                    token = token_response.value
+                else:
+                    logger.error(f"Unexpected token response type: {type(token_response)}")
+                    return False
+                
+                # Update headers with token
+                self.api_client.default_headers['Authorization'] = f"Bearer {token}"
+                
+                logger.info("Successfully authenticated with Deep Lynx")
+                logger.debug(f"Token set in headers, length: {len(token)}")
+                
+                return True
+                
+            except ApiException as e:
+                logger.error(f"Authentication API call failed: Status {e.status}, Body: {e.body}")
+                return False
+                
         except Exception as e:
             logger.error(f"Unexpected error during authentication: {str(e)}")
             return False
@@ -1122,8 +1172,8 @@ class DeepLynxTester:
                         logger.debug(f"Data source ID: {source.id}")
                         logger.debug(f"Metadata: {json.dumps(metadata, indent=2)}")
                         
-                        # Attempt upload
-                        upload_result = self.imports_api.upload_file(
+                        # Changed create_file to upload_file
+                        upload_result = self.datasources_api.upload_file(
                             container_id=self.container_id,
                             data_source_id=source.id,
                             file=file,
