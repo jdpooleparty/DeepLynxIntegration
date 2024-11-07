@@ -15,7 +15,7 @@ from contextlib import contextmanager
 import json
 from prometheus_client import Counter, Histogram, start_http_server
 import pytest
-import sys
+import sys #important for pytest
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
