@@ -22,64 +22,46 @@ def list_available_containers(client: DeepLynxClient = None, include_all: bool =
     try:
         container_list = []
         
-        # Try to list all containers first (admin endpoint)
+        # Get all containers using ContainersApi
         try:
             containers = client.containers_api.list_containers()
-            logger.debug("Successfully accessed admin container list")
+            logger.debug("Successfully accessed containers list")
             
             if hasattr(containers, 'value') and containers.value:
                 for container in containers.value:
+                    # Check membership by attempting to list users
+                    is_member = False
+                    try:
+                        users = client.users_api.list_users_for_container(container_id=container.id)
+                        if hasattr(users, 'value') and users.value:
+                            is_member = True
+                    except ApiException as e:
+                        if e.status == 403:  # Permission denied means not a member
+                            is_member = False
+                        else:
+                            logger.warning(f"Error checking container membership {container.id}: {e.reason}")
+                    
                     container_info = {
                         'id': container.id,
                         'name': container.name,
                         'description': getattr(container, 'description', ''),
                         'active': getattr(container, 'active', False),
-                        'is_member': False  # Will be updated below
+                        'is_member': is_member
                     }
                     container_list.append(container_info)
                     logger.info(f"Found container: {container.name} (ID: {container.id})")
             
         except ApiException as e:
-            if e.status == 403:
-                logger.debug("Admin access denied, falling back to user containers")
-            else:
-                raise
-        
-        # Check membership for each container by trying to list users
-        try:
-            member_container_ids = set()
-            for container in container_list:
-                try:
-                    # Try to list users for each container - this will only work for containers we're a member of
-                    users = client.users_api.list_users_for_container(container_id=container['id'])
-                    if hasattr(users, 'value') and users.value:
-                        member_container_ids.add(container['id'])
-                except ApiException as e:
-                    if e.status != 403:  # Ignore permission denied errors
-                        logger.warning(f"Error checking container {container['id']}: {e.reason}")
-                    continue
-                    
-            # Update membership status
-            for container in container_list:
-                container['is_member'] = container['id'] in member_container_ids
-                    
-            # If we only want containers the user is a member of
-            if not include_all:
-                container_list = [c for c in container_list if c['is_member']]
-                    
-        except Exception as e:
-            logger.warning(f"Could not verify container membership: {str(e)}")
-            logger.debug("Error details:", exc_info=True)
+            logger.error(f"Failed to list containers: {e.status} - {e.reason}")
+            logger.debug(f"Response body: {e.body}")
+            return []
             
-        return container_list if container_list else []
+        # If we only want containers the user is a member of, filter the list
+        if not include_all:
+            container_list = [c for c in container_list if c['is_member']]
             
-    except ApiException as e:
-        if e.status == 403:
-            logger.error("Permission denied: You may not have sufficient permissions")
-        else:
-            logger.error(f"API Error: {e.status} - {e.reason}")
-        logger.debug(f"Response body: {e.body}")
-        return []
+        return container_list
+            
     except Exception as e:
         logger.error(f"Failed to list containers: {str(e)}")
         logger.debug("Error details:", exc_info=True)
