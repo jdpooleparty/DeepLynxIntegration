@@ -142,6 +142,7 @@ class DeepLynxTester:
         self.data_query_api = deep_lynx.DataQueryApi(self.api_client)
         self.containers_api = deep_lynx.ContainersApi(self.api_client)
         self.metatypes_api = deep_lynx.MetatypesApi(self.api_client)
+        self.users_api = deep_lynx.UsersApi(self.api_client)
         
         # Debug API initialization
         logger.debug("\n=== API Initialization ===")
@@ -1393,6 +1394,37 @@ class DeepLynxTester:
             logger.debug("Error details:", exc_info=True)
             raise
 
+    def list_container_users(self):
+        """List users assigned to the current container"""
+        try:
+            logger.info("\n=== Listing Container Users ===")
+            
+            # Debug: Log request details
+            logger.debug(f"Container ID: {self.container_id}")
+            logger.debug(f"Headers: {self.api_client.default_headers}")
+            
+            users = self.users_api.list_users_for_container(
+                container_id=self.container_id
+            )
+            
+            if hasattr(users, 'value') and users.value:
+                logger.info(f"Found {len(users.value)} users")
+                for user in users.value:
+                    logger.debug(f"User: {user.display_name} (ID: {user.id})")
+                return users.value
+            else:
+                logger.warning("No users found or unexpected response format")
+                return []
+                
+        except ApiException as e:
+            logger.error(f"API Error: {e.status} - {e.reason}")
+            logger.error(f"Response body: {e.body}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to list users: {str(e)}")
+            logger.debug("Error details:", exc_info=True)
+            raise
+
 def main():
     """Main test execution function with enhanced error handling"""
     try:
@@ -1413,7 +1445,11 @@ def main():
             container_id=container_id
         )
         
-        # ONLY run the PDF upload test
+        # Check container users
+        logger.info("\n=== Checking Container Users ===")
+        users = tester.list_container_users()
+        
+        # Then proceed with PDF upload test
         logger.info("\n=== Starting PDF Upload Test ===")
         pdf_result = tester.test_pdf_upload()
         
